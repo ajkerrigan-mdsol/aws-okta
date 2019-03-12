@@ -31,6 +31,7 @@ type ProviderOptions struct {
 	ExpiryWindow       time.Duration
 	Profiles           Profiles
 	MFAConfig          MFAConfig
+	CredentialHelper   bool
 }
 
 func (o ProviderOptions) Validate() error {

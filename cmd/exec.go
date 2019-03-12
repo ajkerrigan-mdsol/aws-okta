@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"fmt"
 
 	log "github.com/sirupsen/logrus"
@@ -19,16 +20,26 @@ import (
 )
 
 var (
-	sessionTTL    time.Duration
-	assumeRoleTTL time.Duration
+	sessionTTL       time.Duration
+	assumeRoleTTL    time.Duration
+	credentialHelper bool
 )
 
+// json metadata for AWS credential process. Ref: https://docs.aws.amazon.com/cli/latest/topic/config-vars.html#sourcing-credentials-from-external-processes
+type AwsCredentialHelperData struct {
+	Version         int    `json:"Version"`
+	AccessKeyID     string `json:"AccessKeyId"`
+	SecretAccessKey string `json:"SecretAccessKey"`
+	SessionToken    string `json:"SessionToken"`
+	Expiration      string `json:"Expiration,omitempty"`
+}
+
 func mustListProfiles() lib.Profiles {
-  profiles, err := listProfiles()
-  if err != nil {
-    log.Panicf("Failed to list profiles: %v", err)
-  }
-  return profiles
+	profiles, err := listProfiles()
+	if err != nil {
+		log.Panicf("Failed to list profiles: %v", err)
+	}
+	return profiles
 }
 
 // execCmd represents the exec command
@@ -44,6 +55,7 @@ func init() {
 	RootCmd.AddCommand(execCmd)
 	execCmd.Flags().DurationVarP(&sessionTTL, "session-ttl", "t", time.Hour, "Expiration time for okta role session")
 	execCmd.Flags().DurationVarP(&assumeRoleTTL, "assume-role-ttl", "a", time.Hour, "Expiration time for assumed role")
+	execCmd.Flags().BoolVarP(&credentialHelper, "json", "j", false, "Output JSON credentials (used with the AWS CLI credential_process option)")
 }
 
 func loadDurationFlagFromEnv(cmd *cobra.Command, flagName string, envVar string, val *time.Duration) error {
@@ -92,28 +104,32 @@ func execPre(cmd *cobra.Command, args []string) {
 }
 
 func execRun(cmd *cobra.Command, args []string) error {
+	var commandArgs []string
+	var command string
+
 	dashIx := cmd.ArgsLenAtDash()
-	if dashIx == -1 {
-		return ErrCommandMissing
-	}
+	if !credentialHelper {
+		if dashIx == -1 {
+			return ErrCommandMissing
+		}
 
-	args, commandPart := args[:dashIx], args[dashIx:]
-	if len(args) < 1 {
-		return ErrTooFewArguments
-	}
+		args, commandPart := args[:dashIx], args[dashIx:]
+		if len(args) < 1 {
+			return ErrTooFewArguments
+		}
 
-	if len(commandPart) == 0 {
-		return ErrCommandMissing
+		if len(commandPart) == 0 {
+			return ErrCommandMissing
+		}
+
+		command = commandPart[0]
+
+		if len(commandPart) > 1 {
+			commandArgs = commandPart[1:]
+		}
 	}
 
 	profile := args[0]
-	command := commandPart[0]
-
-	var commandArgs []string
-	if len(commandPart) > 1 {
-		commandArgs = commandPart[1:]
-	}
-
 	config, err := lib.NewConfigFromEnv()
 	if err != nil {
 		return err
@@ -142,6 +158,7 @@ func execRun(cmd *cobra.Command, args []string) error {
 		Profiles:           profiles,
 		SessionDuration:    sessionTTL,
 		AssumeRoleDuration: assumeRoleTTL,
+		CredentialHelper:   credentialHelper,
 	}
 
 	var allowedBackends []keyring.BackendType
@@ -175,54 +192,71 @@ func execRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-
-	env := environ(os.Environ())
-	env.Unset("AWS_ACCESS_KEY_ID")
-	env.Unset("AWS_SECRET_ACCESS_KEY")
-	env.Unset("AWS_CREDENTIAL_FILE")
-	env.Unset("AWS_DEFAULT_PROFILE")
-	env.Unset("AWS_PROFILE")
-	env.Unset("AWS_OKTA_PROFILE")
-
-	if region, ok := profiles[profile]["region"]; ok {
-		env.Set("AWS_DEFAULT_REGION", region)
-		env.Set("AWS_REGION", region)
-	}
-
-	env.Set("AWS_ACCESS_KEY_ID", creds.AccessKeyID)
-	env.Set("AWS_SECRET_ACCESS_KEY", creds.SecretAccessKey)
-	env.Set("AWS_OKTA_PROFILE", profile)
-
-	if creds.SessionToken != "" {
-		env.Set("AWS_SESSION_TOKEN", creds.SessionToken)
-		env.Set("AWS_SECURITY_TOKEN", creds.SessionToken)
-	}
-
-	ecmd := exec.Command(command, commandArgs...)
-	ecmd.Stdin = os.Stdin
-	ecmd.Stdout = os.Stdout
-	ecmd.Stderr = os.Stderr
-	ecmd.Env = env
-
-	// Forward SIGINT, SIGTERM, SIGKILL to the child command
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt, os.Kill)
-
-	go func() {
-		sig := <-sigChan
-		if ecmd.Process != nil {
-			ecmd.Process.Signal(sig)
+	if credentialHelper {
+		credentialData := AwsCredentialHelperData{
+			Version:         1,
+			AccessKeyID:     creds.AccessKeyID,
+			SecretAccessKey: creds.SecretAccessKey,
+			SessionToken:    creds.SessionToken,
 		}
-	}()
-
-	var waitStatus syscall.WaitStatus
-	if err := ecmd.Run(); err != nil {
+		// if !input.NoSession {
+		// 	credentialData.Expiration = time.Now().UTC().Add(input.Duration).Format("2006-01-02T15:04:05Z")
+		// }
+		json, err := json.Marshal(&credentialData)
 		if err != nil {
-			return err
+			log.Fatalf("Error creating credential json")
 		}
-		if exitError, ok := err.(*exec.ExitError); ok {
-			waitStatus = exitError.Sys().(syscall.WaitStatus)
-			os.Exit(waitStatus.ExitStatus())
+		fmt.Printf(string(json))
+	} else {
+
+		env := environ(os.Environ())
+		env.Unset("AWS_ACCESS_KEY_ID")
+		env.Unset("AWS_SECRET_ACCESS_KEY")
+		env.Unset("AWS_CREDENTIAL_FILE")
+		env.Unset("AWS_DEFAULT_PROFILE")
+		env.Unset("AWS_PROFILE")
+		env.Unset("AWS_OKTA_PROFILE")
+
+		if region, ok := profiles[profile]["region"]; ok {
+			env.Set("AWS_DEFAULT_REGION", region)
+			env.Set("AWS_REGION", region)
+		}
+
+		env.Set("AWS_ACCESS_KEY_ID", creds.AccessKeyID)
+		env.Set("AWS_SECRET_ACCESS_KEY", creds.SecretAccessKey)
+		env.Set("AWS_OKTA_PROFILE", profile)
+
+		if creds.SessionToken != "" {
+			env.Set("AWS_SESSION_TOKEN", creds.SessionToken)
+			env.Set("AWS_SECURITY_TOKEN", creds.SessionToken)
+		}
+
+		ecmd := exec.Command(command, commandArgs...)
+		ecmd.Stdin = os.Stdin
+		ecmd.Stdout = os.Stdout
+		ecmd.Stderr = os.Stderr
+		ecmd.Env = env
+
+		// Forward SIGINT, SIGTERM, SIGKILL to the child command
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt, os.Kill)
+
+		go func() {
+			sig := <-sigChan
+			if ecmd.Process != nil {
+				ecmd.Process.Signal(sig)
+			}
+		}()
+
+		var waitStatus syscall.WaitStatus
+		if err := ecmd.Run(); err != nil {
+			if err != nil {
+				return err
+			}
+			if exitError, ok := err.(*exec.ExitError); ok {
+				waitStatus = exitError.Sys().(syscall.WaitStatus)
+				os.Exit(waitStatus.ExitStatus())
+			}
 		}
 	}
 	return nil
